@@ -20,7 +20,9 @@
 //! processes.
 
 use super::super::proto_error;
+use crate::serde::protobuf::integer_type::IntegerTypeEnum;
 use crate::serde::{byte_to_string, protobuf, BallistaError};
+use arrow::datatypes::{IntegerType, UnionMode};
 use datafusion::arrow::datatypes::{
     DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit,
 };
@@ -60,6 +62,7 @@ impl protobuf::IntervalUnit {
         match interval_unit {
             IntervalUnit::YearMonth => protobuf::IntervalUnit::YearMonth,
             IntervalUnit::DayTime => protobuf::IntervalUnit::DayTime,
+            IntervalUnit::MonthDayNano => protobuf::IntervalUnit::MonthDayNano,
         }
     }
 
@@ -71,6 +74,7 @@ impl protobuf::IntervalUnit {
             Some(interval_unit) => Ok(match interval_unit {
                 protobuf::IntervalUnit::YearMonth => IntervalUnit::YearMonth,
                 protobuf::IntervalUnit::DayTime => IntervalUnit::DayTime,
+                protobuf::IntervalUnit::MonthDayNano => IntervalUnit::MonthDayNano,
             }),
             None => Err(proto_error(
                 "Error converting i32 to DateUnit: Passed invalid variant",
@@ -145,6 +149,35 @@ impl From<&DataType> for protobuf::ArrowType {
     }
 }
 
+impl From<&IntegerType> for protobuf::IntegerType {
+    fn from(val: &IntegerType) -> protobuf::IntegerType {
+        protobuf::IntegerType {
+            integer_type_enum: Some(val.into()),
+        }
+    }
+}
+
+impl TryInto<IntegerType> for &protobuf::IntegerType {
+    type Error = BallistaError;
+    fn try_into(self) -> Result<IntegerType, Self::Error> {
+        let pb_integer_type = self.integer_type_enum.as_ref().ok_or_else(|| {
+            proto_error(
+                "Protobuf deserialization error: ArrowType missing required field 'data_type'",
+            )
+        })?;
+        Ok(match pb_integer_type {
+            protobuf::integer_type::IntegerTypeEnum::Int8(_) => IntegerType::Int8,
+            protobuf::integer_type::IntegerTypeEnum::Int16(_) => IntegerType::Int16,
+            protobuf::integer_type::IntegerTypeEnum::Int32(_) => IntegerType::Int32,
+            protobuf::integer_type::IntegerTypeEnum::Int64(_) => IntegerType::Int64,
+            protobuf::integer_type::IntegerTypeEnum::Uint8(_) => IntegerType::UInt8,
+            protobuf::integer_type::IntegerTypeEnum::Uint16(_) => IntegerType::UInt16,
+            protobuf::integer_type::IntegerTypeEnum::Uint32(_) => IntegerType::UInt32,
+            protobuf::integer_type::IntegerTypeEnum::Uint64(_) => IntegerType::UInt64,
+        })
+    }
+}
+
 impl TryInto<DataType> for &protobuf::ArrowType {
     type Error = BallistaError;
     fn try_into(self) -> Result<DataType, Self::Error> {
@@ -153,115 +186,7 @@ impl TryInto<DataType> for &protobuf::ArrowType {
                 "Protobuf deserialization error: ArrowType missing required field 'data_type'",
             )
         })?;
-        Ok(match pb_arrow_type {
-            protobuf::arrow_type::ArrowTypeEnum::None(_) => DataType::Null,
-            protobuf::arrow_type::ArrowTypeEnum::Bool(_) => DataType::Boolean,
-            protobuf::arrow_type::ArrowTypeEnum::Uint8(_) => DataType::UInt8,
-            protobuf::arrow_type::ArrowTypeEnum::Int8(_) => DataType::Int8,
-            protobuf::arrow_type::ArrowTypeEnum::Uint16(_) => DataType::UInt16,
-            protobuf::arrow_type::ArrowTypeEnum::Int16(_) => DataType::Int16,
-            protobuf::arrow_type::ArrowTypeEnum::Uint32(_) => DataType::UInt32,
-            protobuf::arrow_type::ArrowTypeEnum::Int32(_) => DataType::Int32,
-            protobuf::arrow_type::ArrowTypeEnum::Uint64(_) => DataType::UInt64,
-            protobuf::arrow_type::ArrowTypeEnum::Int64(_) => DataType::Int64,
-            protobuf::arrow_type::ArrowTypeEnum::Float16(_) => DataType::Float16,
-            protobuf::arrow_type::ArrowTypeEnum::Float32(_) => DataType::Float32,
-            protobuf::arrow_type::ArrowTypeEnum::Float64(_) => DataType::Float64,
-            protobuf::arrow_type::ArrowTypeEnum::Utf8(_) => DataType::Utf8,
-            protobuf::arrow_type::ArrowTypeEnum::LargeUtf8(_) => DataType::LargeUtf8,
-            protobuf::arrow_type::ArrowTypeEnum::Binary(_) => DataType::Binary,
-            protobuf::arrow_type::ArrowTypeEnum::FixedSizeBinary(size) => {
-                DataType::FixedSizeBinary(*size)
-            }
-            protobuf::arrow_type::ArrowTypeEnum::LargeBinary(_) => DataType::LargeBinary,
-            protobuf::arrow_type::ArrowTypeEnum::Date32(_) => DataType::Date32,
-            protobuf::arrow_type::ArrowTypeEnum::Date64(_) => DataType::Date64,
-            protobuf::arrow_type::ArrowTypeEnum::Duration(time_unit_i32) => {
-                DataType::Duration(protobuf::TimeUnit::from_i32_to_arrow(*time_unit_i32)?)
-            }
-            protobuf::arrow_type::ArrowTypeEnum::Timestamp(timestamp) => {
-                DataType::Timestamp(
-                    protobuf::TimeUnit::from_i32_to_arrow(timestamp.time_unit)?,
-                    match timestamp.timezone.is_empty() {
-                        true => None,
-                        false => Some(timestamp.timezone.to_owned()),
-                    },
-                )
-            }
-            protobuf::arrow_type::ArrowTypeEnum::Time32(time_unit_i32) => {
-                DataType::Time32(protobuf::TimeUnit::from_i32_to_arrow(*time_unit_i32)?)
-            }
-            protobuf::arrow_type::ArrowTypeEnum::Time64(time_unit_i32) => {
-                DataType::Time64(protobuf::TimeUnit::from_i32_to_arrow(*time_unit_i32)?)
-            }
-            protobuf::arrow_type::ArrowTypeEnum::Interval(interval_unit_i32) => {
-                DataType::Interval(protobuf::IntervalUnit::from_i32_to_arrow(
-                    *interval_unit_i32,
-                )?)
-            }
-            protobuf::arrow_type::ArrowTypeEnum::Decimal(protobuf::Decimal {
-                whole,
-                fractional,
-            }) => DataType::Decimal(*whole as usize, *fractional as usize),
-            protobuf::arrow_type::ArrowTypeEnum::List(boxed_list) => {
-                let field_ref = boxed_list
-                    .field_type
-                    .as_ref()
-                    .ok_or_else(|| proto_error("Protobuf deserialization error: List message was missing required field 'field_type'"))?
-                    .as_ref();
-                DataType::List(Box::new(field_ref.try_into()?))
-            }
-            protobuf::arrow_type::ArrowTypeEnum::LargeList(boxed_list) => {
-                let field_ref = boxed_list
-                    .field_type
-                    .as_ref()
-                    .ok_or_else(|| proto_error("Protobuf deserialization error: List message was missing required field 'field_type'"))?
-                    .as_ref();
-                DataType::LargeList(Box::new(field_ref.try_into()?))
-            }
-            protobuf::arrow_type::ArrowTypeEnum::FixedSizeList(boxed_list) => {
-                let fsl_ref = boxed_list.as_ref();
-                let pb_fieldtype = fsl_ref
-                    .field_type
-                    .as_ref()
-                    .ok_or_else(|| proto_error("Protobuf deserialization error: FixedSizeList message was missing required field 'field_type'"))?;
-                DataType::FixedSizeList(
-                    Box::new(pb_fieldtype.as_ref().try_into()?),
-                    fsl_ref.list_size,
-                )
-            }
-            protobuf::arrow_type::ArrowTypeEnum::Struct(struct_type) => {
-                let fields = struct_type
-                    .sub_field_types
-                    .iter()
-                    .map(|field| field.try_into())
-                    .collect::<Result<Vec<_>, _>>()?;
-                DataType::Struct(fields)
-            }
-            protobuf::arrow_type::ArrowTypeEnum::Union(union) => {
-                let union_types = union
-                    .union_types
-                    .iter()
-                    .map(|field| field.try_into())
-                    .collect::<Result<Vec<_>, _>>()?;
-                DataType::Union(union_types)
-            }
-            protobuf::arrow_type::ArrowTypeEnum::Dictionary(boxed_dict) => {
-                let dict_ref = boxed_dict.as_ref();
-                let pb_key = dict_ref
-                    .key
-                    .as_ref()
-                    .ok_or_else(|| proto_error("Protobuf deserialization error: Dictionary message was missing required field 'key'"))?;
-                let pb_value = dict_ref
-                    .value
-                    .as_ref()
-                    .ok_or_else(|| proto_error("Protobuf deserialization error: Dictionary message was missing required field 'value'"))?;
-                DataType::Dictionary(
-                    Box::new(pb_key.as_ref().try_into()?),
-                    Box::new(pb_value.as_ref().try_into()?),
-                )
-            }
-        })
+        pb_arrow_type.try_into()
     }
 }
 
@@ -278,6 +203,23 @@ impl TryInto<DataType> for &Box<protobuf::List> {
             None => Err(proto_error(
                 "List message missing required field 'field_type'",
             )),
+        }
+    }
+}
+
+impl From<&IntegerType> for protobuf::integer_type::IntegerTypeEnum {
+    fn from(val: &IntegerType) -> protobuf::integer_type::IntegerTypeEnum {
+        use protobuf::integer_type::IntegerTypeEnum;
+        use protobuf::EmptyMessage;
+        match val {
+            IntegerType::Int8 => IntegerTypeEnum::Int8(EmptyMessage {}),
+            IntegerType::Int16 => IntegerTypeEnum::Int16(EmptyMessage {}),
+            IntegerType::Int32 => IntegerTypeEnum::Int32(EmptyMessage {}),
+            IntegerType::Int64 => IntegerTypeEnum::Int64(EmptyMessage {}),
+            IntegerType::UInt8 => IntegerTypeEnum::Uint8(EmptyMessage {}),
+            IntegerType::UInt16 => IntegerTypeEnum::Uint16(EmptyMessage {}),
+            IntegerType::UInt32 => IntegerTypeEnum::Uint32(EmptyMessage {}),
+            IntegerType::UInt64 => IntegerTypeEnum::Uint64(EmptyMessage {}),
         }
     }
 }
@@ -322,7 +264,9 @@ impl From<&DataType> for protobuf::arrow_type::ArrowTypeEnum {
                 protobuf::IntervalUnit::from_arrow_interval_unit(interval_unit) as i32,
             ),
             DataType::Binary => ArrowTypeEnum::Binary(EmptyMessage {}),
-            DataType::FixedSizeBinary(size) => ArrowTypeEnum::FixedSizeBinary(*size),
+            DataType::FixedSizeBinary(size) => {
+                ArrowTypeEnum::FixedSizeBinary(*size as u32)
+            }
             DataType::LargeBinary => ArrowTypeEnum::LargeBinary(EmptyMessage {}),
             DataType::Utf8 => ArrowTypeEnum::Utf8(EmptyMessage {}),
             DataType::LargeUtf8 => ArrowTypeEnum::LargeUtf8(EmptyMessage {}),
@@ -332,7 +276,7 @@ impl From<&DataType> for protobuf::arrow_type::ArrowTypeEnum {
             DataType::FixedSizeList(item_type, size) => {
                 ArrowTypeEnum::FixedSizeList(Box::new(protobuf::FixedSizeList {
                     field_type: Some(Box::new(item_type.as_ref().into())),
-                    list_size: *size,
+                    list_size: *size as u32,
                 }))
             }
             DataType::LargeList(item_type) => {
@@ -346,15 +290,15 @@ impl From<&DataType> for protobuf::arrow_type::ArrowTypeEnum {
                     .map(|field| field.into())
                     .collect::<Vec<_>>(),
             }),
-            DataType::Union(union_types) => ArrowTypeEnum::Union(protobuf::Union {
+            DataType::Union(union_types, _, _) => ArrowTypeEnum::Union(protobuf::Union {
                 union_types: union_types
                     .iter()
                     .map(|field| field.into())
                     .collect::<Vec<_>>(),
             }),
-            DataType::Dictionary(key_type, value_type) => {
+            DataType::Dictionary(key_type, value_type, _) => {
                 ArrowTypeEnum::Dictionary(Box::new(protobuf::Dictionary {
-                    key: Some(Box::new(key_type.as_ref().into())),
+                    key: Some(key_type.into()),
                     value: Some(Box::new(value_type.as_ref().into())),
                 }))
             }
@@ -363,6 +307,9 @@ impl From<&DataType> for protobuf::arrow_type::ArrowTypeEnum {
                     whole: *whole as u64,
                     fractional: *fractional as u64,
                 })
+            }
+            DataType::Extension(_, _, _) => {
+                panic!("DataType::Extension is not supported")
             }
             DataType::Map(_, _) => {
                 unimplemented!("Ballista does not yet support Map data type")
@@ -495,15 +442,18 @@ impl TryFrom<&DataType> for protobuf::scalar_type::Datatype {
             | DataType::FixedSizeList(_, _)
             | DataType::LargeList(_)
             | DataType::Struct(_)
-            | DataType::Union(_)
-            | DataType::Dictionary(_, _)
-            | DataType::Map(_, _)
+            | DataType::Union(_, _, _)
+            | DataType::Dictionary(_, _, _)
             | DataType::Decimal(_, _) => {
                 return Err(proto_error(format!(
                     "Error converting to Datatype to scalar type, {:?} is invalid as a datafusion scalar.",
                     val
                 )))
             }
+            DataType::Extension(_, _, _) =>
+                panic!("DataType::Extension is not supported"),
+            DataType::Map(_, _) =>
+                panic!("DataType::Map is not supported"),
         };
         Ok(scalar_value)
     }
@@ -652,12 +602,12 @@ impl TryFrom<&datafusion::scalar::ScalarValue> for protobuf::ScalarValue {
             datafusion::scalar::ScalarValue::Date32(val) => {
                 create_proto_scalar(val, PrimitiveScalarType::Date32, |s| Value::Date32Value(*s))
             }
-            datafusion::scalar::ScalarValue::TimestampMicrosecond(val) => {
+            datafusion::scalar::ScalarValue::TimestampMicrosecond(val, _) => {
                 create_proto_scalar(val, PrimitiveScalarType::TimeMicrosecond, |s| {
                     Value::TimeMicrosecondValue(*s)
                 })
             }
-            datafusion::scalar::ScalarValue::TimestampNanosecond(val) => {
+            datafusion::scalar::ScalarValue::TimestampNanosecond(val, _) => {
                 create_proto_scalar(val, PrimitiveScalarType::TimeNanosecond, |s| {
                     Value::TimeNanosecondValue(*s)
                 })
@@ -1134,6 +1084,14 @@ impl TryInto<protobuf::LogicalExprNode> for &Expr {
                     AggregateFunction::Sum => protobuf::AggregateFunction::Sum,
                     AggregateFunction::Avg => protobuf::AggregateFunction::Avg,
                     AggregateFunction::Count => protobuf::AggregateFunction::Count,
+                    AggregateFunction::Variance => protobuf::AggregateFunction::Variance,
+                    AggregateFunction::VariancePop => {
+                        protobuf::AggregateFunction::VariancePop
+                    }
+                    AggregateFunction::Stddev => protobuf::AggregateFunction::Stddev,
+                    AggregateFunction::StddevPop => {
+                        protobuf::AggregateFunction::StddevPop
+                    }
                 };
 
                 let arg = &args[0];
@@ -1364,6 +1322,10 @@ impl From<&AggregateFunction> for protobuf::AggregateFunction {
             AggregateFunction::Count => Self::Count,
             AggregateFunction::ApproxDistinct => Self::ApproxDistinct,
             AggregateFunction::ArrayAgg => Self::ArrayAgg,
+            AggregateFunction::Variance => Self::Variance,
+            AggregateFunction::VariancePop => Self::VariancePop,
+            AggregateFunction::Stddev => Self::Stddev,
+            AggregateFunction::StddevPop => Self::StddevPop,
         }
     }
 }

@@ -21,31 +21,25 @@ use std::any::Any;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
+use arrow::array::*;
+use arrow::compute::aggregate::*;
+use arrow::datatypes::*;
+
 use crate::error::{DataFusionError, Result};
 use crate::physical_plan::{Accumulator, AggregateExpr, PhysicalExpr};
 use crate::scalar::ScalarValue;
-use arrow::compute;
-use arrow::datatypes::{DataType, TimeUnit};
-use arrow::{
-    array::{
-        ArrayRef, Date32Array, Date64Array, Float32Array, Float64Array, Int16Array,
-        Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
-    },
-    datatypes::Field,
-};
+
+type StringArray = Utf8Array<i32>;
+type LargeStringArray = Utf8Array<i64>;
 
 use super::format_state_name;
-use crate::arrow::array::Array;
-use arrow::array::DecimalArray;
 
 // Min/max aggregation can take Dictionary encode input but always produces unpacked
 // (aka non Dictionary) output. We need to adjust the output data type to reflect this.
 // The reason min/max aggregate produces unpacked output because there is only one
 // min/max value per group; there is no needs to keep them Dictionary encode
 fn min_max_aggregate_data_type(input_type: DataType) -> DataType {
-    if let DataType::Dictionary(_, value_type) = input_type {
+    if let DataType::Dictionary(_, value_type, _) = input_type {
         *value_type
     } else {
         input_type
@@ -116,7 +110,7 @@ impl AggregateExpr for Max {
 macro_rules! typed_min_max_batch_string {
     ($VALUES:expr, $ARRAYTYPE:ident, $SCALAR:ident, $OP:ident) => {{
         let array = $VALUES.as_any().downcast_ref::<$ARRAYTYPE>().unwrap();
-        let value = compute::$OP(array);
+        let value = $OP(array);
         let value = value.and_then(|e| Some(e.to_string()));
         ScalarValue::$SCALAR(value)
     }};
@@ -126,8 +120,14 @@ macro_rules! typed_min_max_batch_string {
 macro_rules! typed_min_max_batch {
     ($VALUES:expr, $ARRAYTYPE:ident, $SCALAR:ident, $OP:ident) => {{
         let array = $VALUES.as_any().downcast_ref::<$ARRAYTYPE>().unwrap();
-        let value = compute::$OP(array);
+        let value = $OP(array);
         ScalarValue::$SCALAR(value)
+    }};
+
+    ($VALUES:expr, $ARRAYTYPE:ident, $SCALAR:ident, $OP:ident, $TZ:expr) => {{
+        let array = $VALUES.as_any().downcast_ref::<$ARRAYTYPE>().unwrap();
+        let value = $OP(array);
+        ScalarValue::$SCALAR(value, $TZ.clone())
     }};
 }
 
@@ -140,7 +140,7 @@ macro_rules! typed_min_max_batch_decimal128 {
         if null_count == $VALUES.len() {
             ScalarValue::Decimal128(None, *$PRECISION, *$SCALE)
         } else {
-            let array = $VALUES.as_any().downcast_ref::<DecimalArray>().unwrap();
+            let array = $VALUES.as_any().downcast_ref::<Int128Array>().unwrap();
             if null_count == 0 {
                 // there is no null value
                 let mut result = array.value(0);
@@ -171,17 +171,10 @@ macro_rules! typed_min_max_batch_decimal128 {
 macro_rules! min_max_batch {
     ($VALUES:expr, $OP:ident) => {{
         match $VALUES.data_type() {
-            DataType::Decimal(precision, scale) => {
-                typed_min_max_batch_decimal128!($VALUES, precision, scale, $OP)
-            }
             // all types that have a natural order
-            DataType::Float64 => {
-                typed_min_max_batch!($VALUES, Float64Array, Float64, $OP)
+            DataType::Int64 => {
+                typed_min_max_batch!($VALUES, Int64Array, Int64, $OP)
             }
-            DataType::Float32 => {
-                typed_min_max_batch!($VALUES, Float32Array, Float32, $OP)
-            }
-            DataType::Int64 => typed_min_max_batch!($VALUES, Int64Array, Int64, $OP),
             DataType::Int32 => typed_min_max_batch!($VALUES, Int32Array, Int32, $OP),
             DataType::Int16 => typed_min_max_batch!($VALUES, Int16Array, Int16, $OP),
             DataType::Int8 => typed_min_max_batch!($VALUES, Int8Array, Int8, $OP),
@@ -189,29 +182,32 @@ macro_rules! min_max_batch {
             DataType::UInt32 => typed_min_max_batch!($VALUES, UInt32Array, UInt32, $OP),
             DataType::UInt16 => typed_min_max_batch!($VALUES, UInt16Array, UInt16, $OP),
             DataType::UInt8 => typed_min_max_batch!($VALUES, UInt8Array, UInt8, $OP),
-            DataType::Timestamp(TimeUnit::Second, _) => {
-                typed_min_max_batch!($VALUES, TimestampSecondArray, TimestampSecond, $OP)
+            DataType::Timestamp(TimeUnit::Second, tz_opt) => {
+                typed_min_max_batch!($VALUES, Int64Array, TimestampSecond, $OP, tz_opt)
             }
-            DataType::Timestamp(TimeUnit::Millisecond, _) => typed_min_max_batch!(
+            DataType::Timestamp(TimeUnit::Millisecond, tz_opt) => typed_min_max_batch!(
                 $VALUES,
-                TimestampMillisecondArray,
+                Int64Array,
                 TimestampMillisecond,
-                $OP
+                $OP,
+                tz_opt
             ),
-            DataType::Timestamp(TimeUnit::Microsecond, _) => typed_min_max_batch!(
+            DataType::Timestamp(TimeUnit::Microsecond, tz_opt) => typed_min_max_batch!(
                 $VALUES,
-                TimestampMicrosecondArray,
+                Int64Array,
                 TimestampMicrosecond,
-                $OP
+                $OP,
+                tz_opt
             ),
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => typed_min_max_batch!(
+            DataType::Timestamp(TimeUnit::Nanosecond, tz_opt) => typed_min_max_batch!(
                 $VALUES,
-                TimestampNanosecondArray,
+                Int64Array,
                 TimestampNanosecond,
-                $OP
+                $OP,
+                tz_opt
             ),
-            DataType::Date32 => typed_min_max_batch!($VALUES, Date32Array, Date32, $OP),
-            DataType::Date64 => typed_min_max_batch!($VALUES, Date64Array, Date64, $OP),
+            DataType::Date32 => typed_min_max_batch!($VALUES, Int32Array, Date32, $OP),
+            DataType::Date64 => typed_min_max_batch!($VALUES, Int64Array, Date64, $OP),
             other => {
                 // This should have been handled before
                 return Err(DataFusionError::Internal(format!(
@@ -232,7 +228,16 @@ fn min_batch(values: &ArrayRef) -> Result<ScalarValue> {
         DataType::LargeUtf8 => {
             typed_min_max_batch_string!(values, LargeStringArray, LargeUtf8, min_string)
         }
-        _ => min_max_batch!(values, min),
+        DataType::Float64 => {
+            typed_min_max_batch!(values, Float64Array, Float64, min_primitive)
+        }
+        DataType::Float32 => {
+            typed_min_max_batch!(values, Float32Array, Float32, min_primitive)
+        }
+        DataType::Decimal(precision, scale) => {
+            typed_min_max_batch_decimal128!(values, precision, scale, min)
+        }
+        _ => min_max_batch!(values, min_primitive),
     })
 }
 
@@ -245,7 +250,16 @@ fn max_batch(values: &ArrayRef) -> Result<ScalarValue> {
         DataType::LargeUtf8 => {
             typed_min_max_batch_string!(values, LargeStringArray, LargeUtf8, max_string)
         }
-        _ => min_max_batch!(values, max),
+        DataType::Float64 => {
+            typed_min_max_batch!(values, Float64Array, Float64, max_primitive)
+        }
+        DataType::Float32 => {
+            typed_min_max_batch!(values, Float32Array, Float32, max_primitive)
+        }
+        DataType::Decimal(precision, scale) => {
+            typed_min_max_batch_decimal128!(values, precision, scale, max)
+        }
+        _ => min_max_batch!(values, max_primitive),
     })
 }
 macro_rules! typed_min_max_decimal {
@@ -272,6 +286,18 @@ macro_rules! typed_min_max {
             (None, Some(b)) => Some(b.clone()),
             (Some(a), Some(b)) => Some((*a).$OP(*b)),
         })
+    }};
+
+    ($VALUE:expr, $DELTA:expr, $SCALAR:ident, $OP:ident, $TZ:expr) => {{
+        ScalarValue::$SCALAR(
+            match ($VALUE, $DELTA) {
+                (None, None) => None,
+                (Some(a), None) => Some(a.clone()),
+                (None, Some(b)) => Some(b.clone()),
+                (Some(a), Some(b)) => Some((*a).$OP(*b)),
+            },
+            $TZ.clone(),
+        )
     }};
 }
 
@@ -337,26 +363,26 @@ macro_rules! min_max {
             (ScalarValue::LargeUtf8(lhs), ScalarValue::LargeUtf8(rhs)) => {
                 typed_min_max_string!(lhs, rhs, LargeUtf8, $OP)
             }
-            (ScalarValue::TimestampSecond(lhs), ScalarValue::TimestampSecond(rhs)) => {
-                typed_min_max!(lhs, rhs, TimestampSecond, $OP)
+            (ScalarValue::TimestampSecond(lhs, l_tz), ScalarValue::TimestampSecond(rhs, _)) => {
+                typed_min_max!(lhs, rhs, TimestampSecond, $OP, l_tz)
             }
             (
-                ScalarValue::TimestampMillisecond(lhs),
-                ScalarValue::TimestampMillisecond(rhs),
+                ScalarValue::TimestampMillisecond(lhs, l_tz),
+                ScalarValue::TimestampMillisecond(rhs, _),
             ) => {
-                typed_min_max!(lhs, rhs, TimestampMillisecond, $OP)
+                typed_min_max!(lhs, rhs, TimestampMillisecond, $OP, l_tz)
             }
             (
-                ScalarValue::TimestampMicrosecond(lhs),
-                ScalarValue::TimestampMicrosecond(rhs),
+                ScalarValue::TimestampMicrosecond(lhs, l_tz),
+                ScalarValue::TimestampMicrosecond(rhs, _),
             ) => {
-                typed_min_max!(lhs, rhs, TimestampMicrosecond, $OP)
+                typed_min_max!(lhs, rhs, TimestampMicrosecond, $OP, l_tz)
             }
             (
-                ScalarValue::TimestampNanosecond(lhs),
-                ScalarValue::TimestampNanosecond(rhs),
+                ScalarValue::TimestampNanosecond(lhs, l_tz),
+                ScalarValue::TimestampNanosecond(rhs, _),
             ) => {
-                typed_min_max!(lhs, rhs, TimestampNanosecond, $OP)
+                typed_min_max!(lhs, rhs, TimestampNanosecond, $OP, l_tz)
             }
             (
                 ScalarValue::Date32(lhs),
@@ -549,8 +575,6 @@ mod tests {
     use crate::physical_plan::expressions::tests::aggregate;
     use crate::scalar::ScalarValue::Decimal128;
     use crate::{error::Result, generic_test_op};
-    use arrow::array::DecimalBuilder;
-    use arrow::datatypes::*;
     use arrow::record_batch::RecordBatch;
 
     #[test]
@@ -562,32 +586,26 @@ mod tests {
         assert_eq!(result, left);
 
         // min batch
-        let mut decimal_builder = DecimalBuilder::new(5, 10, 0);
-        for i in 1..6 {
-            decimal_builder.append_value(i as i128)?;
-        }
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
-
+        let array: ArrayRef = Arc::new(
+            Int128Array::from_slice(&[1, 2, 3, 4, 5]).to(DataType::Decimal(10, 0)),
+        );
         let result = min_batch(&array)?;
         assert_eq!(result, ScalarValue::Decimal128(Some(1), 10, 0));
         // min batch without values
-        let mut decimal_builder = DecimalBuilder::new(5, 10, 0);
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
+        let array: ArrayRef =
+            Arc::new(Int128Array::new_null(DataType::Decimal(10, 0), 5));
         let result = min_batch(&array)?;
         assert_eq!(ScalarValue::Decimal128(None, 10, 0), result);
 
-        let mut decimal_builder = DecimalBuilder::new(0, 10, 0);
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
+        let array: ArrayRef = Arc::new(Int128Array::new_empty(DataType::Decimal(10, 0)));
         let result = min_batch(&array)?;
         assert_eq!(ScalarValue::Decimal128(None, 10, 0), result);
 
         // min batch with agg
-        let mut decimal_builder = DecimalBuilder::new(6, 10, 0);
-        decimal_builder.append_null().unwrap();
-        for i in 1..6 {
-            decimal_builder.append_value(i as i128)?;
-        }
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
+        let array: ArrayRef = Arc::new(
+            Int128Array::from(vec![None, Some(1), Some(2), Some(3), Some(4), Some(5)])
+                .to(DataType::Decimal(10, 0)),
+        );
         generic_test_op!(
             array,
             DataType::Decimal(10, 0),
@@ -600,11 +618,8 @@ mod tests {
     #[test]
     fn min_decimal_all_nulls() -> Result<()> {
         // min batch all nulls
-        let mut decimal_builder = DecimalBuilder::new(5, 10, 0);
-        for _i in 1..6 {
-            decimal_builder.append_null()?;
-        }
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
+        let array: ArrayRef =
+            Arc::new(Int128Array::new_null(DataType::Decimal(10, 0), 5));
         generic_test_op!(
             array,
             DataType::Decimal(10, 0),
@@ -617,15 +632,10 @@ mod tests {
     #[test]
     fn min_decimal_with_nulls() -> Result<()> {
         // min batch with nulls
-        let mut decimal_builder = DecimalBuilder::new(5, 10, 0);
-        for i in 1..6 {
-            if i == 2 {
-                decimal_builder.append_null()?;
-            } else {
-                decimal_builder.append_value(i as i128)?;
-            }
-        }
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
+        let array: ArrayRef = Arc::new(
+            Int128Array::from(vec![Some(1), None, Some(3), Some(4), Some(5)])
+                .to(DataType::Decimal(10, 0)),
+        );
         generic_test_op!(
             array,
             DataType::Decimal(10, 0),
@@ -652,30 +662,21 @@ mod tests {
         assert_eq!(expect.to_string(), result.unwrap_err().to_string());
 
         // max batch
-        let mut decimal_builder = DecimalBuilder::new(5, 10, 5);
-        for i in 1..6 {
-            decimal_builder.append_value(i as i128)?;
-        }
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
+        let array: ArrayRef = Arc::new(
+            Int128Array::from_slice(&[1, 2, 3, 4, 5]).to(DataType::Decimal(10, 5)),
+        );
         let result = max_batch(&array)?;
         assert_eq!(result, ScalarValue::Decimal128(Some(5), 10, 5));
         // max batch without values
-        let mut decimal_builder = DecimalBuilder::new(5, 10, 0);
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
-        let result = max_batch(&array)?;
-        assert_eq!(ScalarValue::Decimal128(None, 10, 0), result);
-
-        let mut decimal_builder = DecimalBuilder::new(0, 10, 0);
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
+        let array: ArrayRef =
+            Arc::new(Int128Array::new_null(DataType::Decimal(10, 0), 5));
         let result = max_batch(&array)?;
         assert_eq!(ScalarValue::Decimal128(None, 10, 0), result);
         // max batch with agg
-        let mut decimal_builder = DecimalBuilder::new(6, 10, 0);
-        decimal_builder.append_null().unwrap();
-        for i in 1..6 {
-            decimal_builder.append_value(i as i128)?;
-        }
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
+        let array: ArrayRef = Arc::new(
+            Int128Array::from(vec![None, Some(1), Some(2), Some(3), Some(4), Some(5)])
+                .to(DataType::Decimal(10, 0)),
+        );
         generic_test_op!(
             array,
             DataType::Decimal(10, 0),
@@ -687,15 +688,10 @@ mod tests {
 
     #[test]
     fn max_decimal_with_nulls() -> Result<()> {
-        let mut decimal_builder = DecimalBuilder::new(5, 10, 0);
-        for i in 1..6 {
-            if i == 2 {
-                decimal_builder.append_null()?;
-            } else {
-                decimal_builder.append_value(i as i128)?;
-            }
-        }
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
+        let array: ArrayRef = Arc::new(
+            Int128Array::from(vec![Some(1), None, Some(3), Some(4), Some(5)])
+                .to(DataType::Decimal(10, 0)),
+        );
         generic_test_op!(
             array,
             DataType::Decimal(10, 0),
@@ -707,11 +703,8 @@ mod tests {
 
     #[test]
     fn max_decimal_all_nulls() -> Result<()> {
-        let mut decimal_builder = DecimalBuilder::new(5, 10, 0);
-        for _i in 1..6 {
-            decimal_builder.append_null()?;
-        }
-        let array: ArrayRef = Arc::new(decimal_builder.finish());
+        let array: ArrayRef =
+            Arc::new(Int128Array::new_null(DataType::Decimal(10, 0), 5));
         generic_test_op!(
             array,
             DataType::Decimal(10, 0),
@@ -723,7 +716,7 @@ mod tests {
 
     #[test]
     fn max_i32() -> Result<()> {
-        let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[1, 2, 3, 4, 5]));
         generic_test_op!(
             a,
             DataType::Int32,
@@ -735,7 +728,7 @@ mod tests {
 
     #[test]
     fn min_i32() -> Result<()> {
-        let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[1, 2, 3, 4, 5]));
         generic_test_op!(
             a,
             DataType::Int32,
@@ -747,7 +740,7 @@ mod tests {
 
     #[test]
     fn max_utf8() -> Result<()> {
-        let a: ArrayRef = Arc::new(StringArray::from(vec!["d", "a", "c", "b"]));
+        let a: ArrayRef = Arc::new(StringArray::from_slice(&["d", "a", "c", "b"]));
         generic_test_op!(
             a,
             DataType::Utf8,
@@ -759,7 +752,7 @@ mod tests {
 
     #[test]
     fn max_large_utf8() -> Result<()> {
-        let a: ArrayRef = Arc::new(LargeStringArray::from(vec!["d", "a", "c", "b"]));
+        let a: ArrayRef = Arc::new(LargeStringArray::from_slice(&["d", "a", "c", "b"]));
         generic_test_op!(
             a,
             DataType::LargeUtf8,
@@ -771,7 +764,7 @@ mod tests {
 
     #[test]
     fn min_utf8() -> Result<()> {
-        let a: ArrayRef = Arc::new(StringArray::from(vec!["d", "a", "c", "b"]));
+        let a: ArrayRef = Arc::new(StringArray::from_slice(&["d", "a", "c", "b"]));
         generic_test_op!(
             a,
             DataType::Utf8,
@@ -783,7 +776,7 @@ mod tests {
 
     #[test]
     fn min_large_utf8() -> Result<()> {
-        let a: ArrayRef = Arc::new(LargeStringArray::from(vec!["d", "a", "c", "b"]));
+        let a: ArrayRef = Arc::new(LargeStringArray::from_slice(&["d", "a", "c", "b"]));
         generic_test_op!(
             a,
             DataType::LargeUtf8,
@@ -795,7 +788,7 @@ mod tests {
 
     #[test]
     fn max_i32_with_nulls() -> Result<()> {
-        let a: ArrayRef = Arc::new(Int32Array::from(vec![
+        let a: ArrayRef = Arc::new(Int32Array::from(&[
             Some(1),
             None,
             Some(3),
@@ -813,7 +806,7 @@ mod tests {
 
     #[test]
     fn min_i32_with_nulls() -> Result<()> {
-        let a: ArrayRef = Arc::new(Int32Array::from(vec![
+        let a: ArrayRef = Arc::new(Int32Array::from(&[
             Some(1),
             None,
             Some(3),
@@ -831,7 +824,7 @@ mod tests {
 
     #[test]
     fn max_i32_all_nulls() -> Result<()> {
-        let a: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
+        let a: ArrayRef = Arc::new(Int32Array::from(&[None, None]));
         generic_test_op!(
             a,
             DataType::Int32,
@@ -843,7 +836,7 @@ mod tests {
 
     #[test]
     fn min_i32_all_nulls() -> Result<()> {
-        let a: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
+        let a: ArrayRef = Arc::new(Int32Array::from(&[None, None]));
         generic_test_op!(
             a,
             DataType::Int32,
@@ -855,8 +848,9 @@ mod tests {
 
     #[test]
     fn max_u32() -> Result<()> {
-        let a: ArrayRef =
-            Arc::new(UInt32Array::from(vec![1_u32, 2_u32, 3_u32, 4_u32, 5_u32]));
+        let a: ArrayRef = Arc::new(UInt32Array::from_slice(&[
+            1_u32, 2_u32, 3_u32, 4_u32, 5_u32,
+        ]));
         generic_test_op!(
             a,
             DataType::UInt32,
@@ -868,8 +862,9 @@ mod tests {
 
     #[test]
     fn min_u32() -> Result<()> {
-        let a: ArrayRef =
-            Arc::new(UInt32Array::from(vec![1_u32, 2_u32, 3_u32, 4_u32, 5_u32]));
+        let a: ArrayRef = Arc::new(UInt32Array::from_slice(&[
+            1_u32, 2_u32, 3_u32, 4_u32, 5_u32,
+        ]));
         generic_test_op!(
             a,
             DataType::UInt32,
@@ -881,8 +876,9 @@ mod tests {
 
     #[test]
     fn max_f32() -> Result<()> {
-        let a: ArrayRef =
-            Arc::new(Float32Array::from(vec![1_f32, 2_f32, 3_f32, 4_f32, 5_f32]));
+        let a: ArrayRef = Arc::new(Float32Array::from_slice(&[
+            1_f32, 2_f32, 3_f32, 4_f32, 5_f32,
+        ]));
         generic_test_op!(
             a,
             DataType::Float32,
@@ -894,8 +890,9 @@ mod tests {
 
     #[test]
     fn min_f32() -> Result<()> {
-        let a: ArrayRef =
-            Arc::new(Float32Array::from(vec![1_f32, 2_f32, 3_f32, 4_f32, 5_f32]));
+        let a: ArrayRef = Arc::new(Float32Array::from_slice(&[
+            1_f32, 2_f32, 3_f32, 4_f32, 5_f32,
+        ]));
         generic_test_op!(
             a,
             DataType::Float32,
@@ -907,8 +904,9 @@ mod tests {
 
     #[test]
     fn max_f64() -> Result<()> {
-        let a: ArrayRef =
-            Arc::new(Float64Array::from(vec![1_f64, 2_f64, 3_f64, 4_f64, 5_f64]));
+        let a: ArrayRef = Arc::new(Float64Array::from_slice(&[
+            1_f64, 2_f64, 3_f64, 4_f64, 5_f64,
+        ]));
         generic_test_op!(
             a,
             DataType::Float64,
@@ -920,8 +918,9 @@ mod tests {
 
     #[test]
     fn min_f64() -> Result<()> {
-        let a: ArrayRef =
-            Arc::new(Float64Array::from(vec![1_f64, 2_f64, 3_f64, 4_f64, 5_f64]));
+        let a: ArrayRef = Arc::new(Float64Array::from_slice(&[
+            1_f64, 2_f64, 3_f64, 4_f64, 5_f64,
+        ]));
         generic_test_op!(
             a,
             DataType::Float64,
@@ -933,7 +932,8 @@ mod tests {
 
     #[test]
     fn min_date32() -> Result<()> {
-        let a: ArrayRef = Arc::new(Date32Array::from(vec![1, 2, 3, 4, 5]));
+        let a: ArrayRef =
+            Arc::new(Int32Array::from_slice(&[1, 2, 3, 4, 5]).to(DataType::Date32));
         generic_test_op!(
             a,
             DataType::Date32,
@@ -945,7 +945,8 @@ mod tests {
 
     #[test]
     fn min_date64() -> Result<()> {
-        let a: ArrayRef = Arc::new(Date64Array::from(vec![1, 2, 3, 4, 5]));
+        let a: ArrayRef =
+            Arc::new(Int64Array::from_slice(&[1, 2, 3, 4, 5]).to(DataType::Date64));
         generic_test_op!(
             a,
             DataType::Date64,
@@ -957,7 +958,8 @@ mod tests {
 
     #[test]
     fn max_date32() -> Result<()> {
-        let a: ArrayRef = Arc::new(Date32Array::from(vec![1, 2, 3, 4, 5]));
+        let a: ArrayRef =
+            Arc::new(Int32Array::from_slice(&[1, 2, 3, 4, 5]).to(DataType::Date32));
         generic_test_op!(
             a,
             DataType::Date32,
@@ -969,7 +971,8 @@ mod tests {
 
     #[test]
     fn max_date64() -> Result<()> {
-        let a: ArrayRef = Arc::new(Date64Array::from(vec![1, 2, 3, 4, 5]));
+        let a: ArrayRef =
+            Arc::new(Int64Array::from_slice(&[1, 2, 3, 4, 5]).to(DataType::Date64));
         generic_test_op!(
             a,
             DataType::Date64,

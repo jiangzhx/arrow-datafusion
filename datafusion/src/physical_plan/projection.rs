@@ -29,7 +29,8 @@ use crate::error::{DataFusionError, Result};
 use crate::physical_plan::{
     ColumnStatistics, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
 };
-use arrow::datatypes::{Field, Schema, SchemaRef};
+
+use arrow::datatypes::{Field, Metadata, Schema, SchemaRef};
 use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 
@@ -63,20 +64,21 @@ impl ProjectionExec {
 
         let fields: Result<Vec<Field>> = expr
             .iter()
-            .map(|(e, name)| match input_schema.field_with_name(name) {
-                Ok(f) => Ok(f.clone()),
-                Err(_) => {
-                    let dt = e.data_type(&input_schema)?;
-                    let nullable = e.nullable(&input_schema)?;
-                    Ok(Field::new(name, dt, nullable))
+            .map(|(e, name)| {
+                let mut field = Field::new(
+                    name,
+                    e.data_type(&input_schema)?,
+                    e.nullable(&input_schema)?,
+                );
+                if let Some(metadata) = get_field_metadata(e, &input_schema) {
+                    field = field.with_metadata(metadata);
                 }
+
+                Ok(field)
             })
             .collect();
 
-        let schema = Arc::new(Schema::new_with_metadata(
-            fields?,
-            input_schema.metadata().clone(),
-        ));
+        let schema = Arc::new(Schema::new_from(fields?, input_schema.metadata().clone()));
 
         Ok(Self {
             expr,
@@ -177,6 +179,24 @@ impl ExecutionPlan for ProjectionExec {
             self.expr.iter().map(|(e, _)| Arc::clone(e)),
         )
     }
+}
+
+/// If e is a direct column reference, returns the field level
+/// metadata for that field, if any. Otherwise returns None
+fn get_field_metadata(
+    e: &Arc<dyn PhysicalExpr>,
+    input_schema: &Schema,
+) -> Option<Metadata> {
+    let name = if let Some(column) = e.as_any().downcast_ref::<Column>() {
+        column.name()
+    } else {
+        return None;
+    };
+
+    input_schema
+        .field_with_name(name)
+        .ok()
+        .map(|f| f.metadata().clone())
 }
 
 fn stats_projection(
@@ -300,7 +320,7 @@ mod tests {
         )?;
 
         let col_field = projection.schema.field(0);
-        let col_metadata = col_field.metadata().clone().unwrap().clone();
+        let col_metadata = col_field.metadata().clone();
         let data: &str = &col_metadata["testing"];
         assert_eq!(data, "test");
 

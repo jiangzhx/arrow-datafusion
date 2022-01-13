@@ -17,6 +17,9 @@
 
 //! Benchmark derived from TPC-H. This is not an official TPC-H benchmark.
 
+use futures::future::join_all;
+use rand::prelude::*;
+use std::ops::Div;
 use std::{
     fs,
     iter::Iterator,
@@ -25,14 +28,15 @@ use std::{
     time::Instant,
 };
 
-use ballista::context::BallistaContext;
-use ballista::prelude::{BallistaConfig, BALLISTA_DEFAULT_SHUFFLE_PARTITIONS};
+use datafusion::arrow::io::print;
 
+use datafusion::datasource::{
+    listing::{ListingOptions, ListingTable},
+    object_store::local::LocalFileSystem,
+};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_plan::LogicalPlan;
-use datafusion::parquet::basic::Compression;
-use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::*;
@@ -43,21 +47,19 @@ use datafusion::{
 use datafusion::{
     arrow::record_batch::RecordBatch, datasource::file_format::parquet::ParquetFormat,
 };
-use datafusion::{
-    arrow::util::pretty,
-    datasource::{
-        listing::{ListingOptions, ListingTable},
-        object_store::local::LocalFileSystem,
-    },
-};
 
+use arrow::io::parquet::write::{Compression, Version, WriteOptions};
+use arrow::io::print::print;
+use ballista::prelude::{
+    BallistaConfig, BallistaContext, BALLISTA_DEFAULT_SHUFFLE_PARTITIONS,
+};
 use structopt::StructOpt;
 
-#[cfg(feature = "snmalloc")]
+#[cfg(all(feature = "snmalloc", not(feature = "mimalloc")))]
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
-#[cfg(feature = "mimalloc")]
+#[cfg(all(feature = "mimalloc", not(feature = "snmalloc")))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -137,6 +139,48 @@ struct DataFusionBenchmarkOpt {
     mem_table: bool,
 }
 
+#[derive(Debug, StructOpt, Clone)]
+struct BallistaLoadtestOpt {
+    #[structopt(short = "q", long)]
+    query_list: String,
+
+    /// Activate debug mode to see query results
+    #[structopt(short, long)]
+    debug: bool,
+
+    /// Number of requests
+    #[structopt(short = "r", long = "requests", default_value = "100")]
+    requests: usize,
+
+    /// Number of connections
+    #[structopt(short = "c", long = "concurrency", default_value = "5")]
+    concurrency: usize,
+
+    /// Number of partitions to process in parallel
+    #[structopt(short = "n", long = "partitions", default_value = "2")]
+    partitions: usize,
+
+    /// Path to data files
+    #[structopt(parse(from_os_str), required = true, short = "p", long = "data-path")]
+    path: PathBuf,
+
+    /// Path to sql files
+    #[structopt(parse(from_os_str), required = true, long = "sql-path")]
+    sql_path: PathBuf,
+
+    /// File format: `csv` or `parquet`
+    #[structopt(short = "f", long = "format", default_value = "parquet")]
+    file_format: String,
+
+    /// Ballista executor host
+    #[structopt(long = "host")]
+    host: Option<String>,
+
+    /// Ballista executor port
+    #[structopt(long = "port")]
+    port: Option<u16>,
+}
+
 #[derive(Debug, StructOpt)]
 struct ConvertOpt {
     /// Path to csv files
@@ -174,10 +218,18 @@ enum BenchmarkSubCommandOpt {
 }
 
 #[derive(Debug, StructOpt)]
+#[structopt(about = "loadtest command")]
+enum LoadtestOpt {
+    #[structopt(name = "ballista-load")]
+    BallistaLoadtest(BallistaLoadtestOpt),
+}
+
+#[derive(Debug, StructOpt)]
 #[structopt(name = "TPC-H", about = "TPC-H Benchmarks.")]
 enum TpchOpt {
     Benchmark(BenchmarkSubCommandOpt),
     Convert(ConvertOpt),
+    Loadtest(LoadtestOpt),
 }
 
 const TABLES: &[&str] = &[
@@ -187,6 +239,7 @@ const TABLES: &[&str] = &[
 #[tokio::main]
 async fn main() -> Result<()> {
     use BenchmarkSubCommandOpt::*;
+    use LoadtestOpt::*;
 
     env_logger::init();
     match TpchOpt::from_args() {
@@ -197,6 +250,9 @@ async fn main() -> Result<()> {
             benchmark_datafusion(opt).await.map(|_| ())
         }
         TpchOpt::Convert(opt) => convert_tbl(opt).await,
+        TpchOpt::Loadtest(BallistaLoadtest(opt)) => {
+            loadtest_ballista(opt).await.map(|_| ())
+        }
     }
 }
 
@@ -268,6 +324,151 @@ async fn benchmark_ballista(opt: BallistaBenchmarkOpt) -> Result<()> {
     // register tables with Ballista context
     let path = opt.path.to_str().unwrap();
     let file_format = opt.file_format.as_str();
+
+    register_tables(path, file_format, &ctx).await;
+
+    let mut millis = vec![];
+
+    // run benchmark
+    let sql = get_query_sql(opt.query)?;
+    println!("Running benchmark with query {}:\n {}", opt.query, sql);
+    for i in 0..opt.iterations {
+        let start = Instant::now();
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+            .unwrap();
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+            .unwrap();
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        millis.push(elapsed as f64);
+        println!("Query {} iteration {} took {:.1} ms", opt.query, i, elapsed);
+        if opt.debug {
+            print(&batches);
+        }
+    }
+
+    let avg = millis.iter().sum::<f64>() / millis.len() as f64;
+    println!("Query {} avg time: {:.2} ms", opt.query, avg);
+
+    Ok(())
+}
+
+async fn loadtest_ballista(opt: BallistaLoadtestOpt) -> Result<()> {
+    println!(
+        "Running loadtest_ballista with the following options: {:?}",
+        opt
+    );
+
+    let config = BallistaConfig::builder()
+        .set(
+            BALLISTA_DEFAULT_SHUFFLE_PARTITIONS,
+            &format!("{}", opt.partitions),
+        )
+        .build()
+        .map_err(|e| DataFusionError::Execution(format!("{:?}", e)))?;
+
+    let concurrency = opt.concurrency;
+    let request_amount = opt.requests;
+    let mut clients = vec![];
+
+    for _num in 0..concurrency {
+        clients.push(BallistaContext::remote(
+            opt.host.clone().unwrap().as_str(),
+            opt.port.unwrap(),
+            &config,
+        ));
+    }
+
+    // register tables with Ballista context
+    let path = opt.path.to_str().unwrap();
+    let file_format = opt.file_format.as_str();
+    let sql_path = opt.sql_path.to_str().unwrap().to_string();
+
+    for ctx in &clients {
+        register_tables(path, file_format, ctx).await;
+    }
+
+    let request_per_thread = request_amount.div(concurrency);
+    // run benchmark
+    let query_list: Vec<usize> = opt
+        .query_list
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect();
+    println!("query list: {:?} ", &query_list);
+
+    let total = Instant::now();
+    let mut futures = vec![];
+
+    for (client_id, client) in clients.into_iter().enumerate() {
+        let query_list_clone = query_list.clone();
+        let sql_path_clone = sql_path.clone();
+        let handle = tokio::spawn(async move {
+            for i in 0..request_per_thread {
+                let query_id = query_list_clone
+                    .get(
+                        (0..query_list_clone.len())
+                            .choose(&mut rand::thread_rng())
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let sql =
+                    get_query_sql_by_path(query_id.to_owned(), sql_path_clone.clone())
+                        .unwrap();
+                println!(
+                    "Client {} Round {} Query {} started",
+                    &client_id, &i, query_id
+                );
+                let start = Instant::now();
+                let df = client
+                    .sql(&sql)
+                    .await
+                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+                    .unwrap();
+                let batches = df
+                    .collect()
+                    .await
+                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+                    .unwrap();
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "Client {} Round {} Query {} took {:.1} ms ",
+                    &client_id, &i, query_id, elapsed
+                );
+                if opt.debug {
+                    print(&batches);
+                }
+            }
+        });
+        futures.push(handle);
+    }
+    join_all(futures).await;
+    let elapsed = total.elapsed().as_secs_f64() * 1000.0;
+    println!("###############################");
+    println!("load test  took {:.1} ms", elapsed);
+    Ok(())
+}
+
+fn get_query_sql_by_path(query: usize, mut sql_path: String) -> Result<String> {
+    if sql_path.ends_with('/') {
+        sql_path.pop();
+    }
+    if query > 0 && query < 23 {
+        let filename = format!("{}/q{}.sql", sql_path, query);
+        Ok(fs::read_to_string(&filename).expect("failed to read query"))
+    } else {
+        Err(DataFusionError::Plan(
+            "invalid query. Expected value between 1 and 22".to_owned(),
+        ))
+    }
+}
+
+async fn register_tables(path: &str, file_format: &str, ctx: &BallistaContext) {
     for table in TABLES {
         match file_format {
             // dbgen creates .tbl ('|' delimited) files without header
@@ -281,7 +482,8 @@ async fn benchmark_ballista(opt: BallistaBenchmarkOpt) -> Result<()> {
                     .file_extension(".tbl");
                 ctx.register_csv(table, &path, options)
                     .await
-                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))?;
+                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+                    .unwrap();
             }
             "csv" => {
                 let path = format!("{}/{}", path, table);
@@ -289,47 +491,21 @@ async fn benchmark_ballista(opt: BallistaBenchmarkOpt) -> Result<()> {
                 let options = CsvReadOptions::new().schema(&schema).has_header(true);
                 ctx.register_csv(table, &path, options)
                     .await
-                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))?;
+                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+                    .unwrap();
             }
             "parquet" => {
                 let path = format!("{}/{}", path, table);
                 ctx.register_parquet(table, &path)
                     .await
-                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))?;
+                    .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))
+                    .unwrap();
             }
             other => {
                 unimplemented!("Invalid file format '{}'", other);
             }
         }
     }
-
-    let mut millis = vec![];
-
-    // run benchmark
-    let sql = get_query_sql(opt.query)?;
-    println!("Running benchmark with query {}:\n {}", opt.query, sql);
-    for i in 0..opt.iterations {
-        let start = Instant::now();
-        let df = ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| DataFusionError::Plan(format!("{:?}", e)))?;
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        millis.push(elapsed as f64);
-        println!("Query {} iteration {} took {:.1} ms", opt.query, i, elapsed);
-        if opt.debug {
-            pretty::print_batches(&batches)?;
-        }
-    }
-
-    let avg = millis.iter().sum::<f64>() / millis.len() as f64;
-    println!("Query {} avg time: {:.2} ms", opt.query, avg);
-
-    Ok(())
 }
 
 fn get_query_sql(query: usize) -> Result<String> {
@@ -364,18 +540,16 @@ async fn execute_query(
     if debug {
         println!(
             "=== Physical plan ===\n{}\n",
-            displayable(physical_plan.as_ref()).indent().to_string()
+            displayable(physical_plan.as_ref()).indent()
         );
     }
     let result = collect(physical_plan.clone()).await?;
     if debug {
         println!(
             "=== Physical plan with metrics ===\n{}\n",
-            DisplayableExecutionPlan::with_metrics(physical_plan.as_ref())
-                .indent()
-                .to_string()
+            DisplayableExecutionPlan::with_metrics(physical_plan.as_ref()).indent()
         );
-        pretty::print_batches(&result)?;
+        print::print(&result);
     }
     Ok(result)
 }
@@ -419,13 +593,13 @@ async fn convert_tbl(opt: ConvertOpt) -> Result<()> {
             "csv" => ctx.write_csv(csv, output_path).await?,
             "parquet" => {
                 let compression = match opt.compression.as_str() {
-                    "none" => Compression::UNCOMPRESSED,
-                    "snappy" => Compression::SNAPPY,
-                    "brotli" => Compression::BROTLI,
-                    "gzip" => Compression::GZIP,
-                    "lz4" => Compression::LZ4,
-                    "lz0" => Compression::LZO,
-                    "zstd" => Compression::ZSTD,
+                    "none" => Compression::Uncompressed,
+                    "snappy" => Compression::Snappy,
+                    "brotli" => Compression::Brotli,
+                    "gzip" => Compression::Gzip,
+                    "lz4" => Compression::Lz4,
+                    "lz0" => Compression::Lzo,
+                    "zstd" => Compression::Zstd,
                     other => {
                         return Err(DataFusionError::NotImplemented(format!(
                             "Invalid compression format: {}",
@@ -433,10 +607,13 @@ async fn convert_tbl(opt: ConvertOpt) -> Result<()> {
                         )))
                     }
                 };
-                let props = WriterProperties::builder()
-                    .set_compression(compression)
-                    .build();
-                ctx.write_parquet(csv, output_path, Some(props)).await?
+
+                let options = WriteOptions {
+                    compression,
+                    write_statistics: false,
+                    version: Version::V1,
+                };
+                ctx.write_parquet(csv, output_path, options).await?
             }
             other => {
                 return Err(DataFusionError::NotImplemented(format!(
@@ -606,8 +783,8 @@ mod tests {
     use std::env;
     use std::sync::Arc;
 
+    use arrow::array::get_display;
     use datafusion::arrow::array::*;
-    use datafusion::arrow::util::display::array_value_to_string;
     use datafusion::logical_plan::Expr;
     use datafusion::logical_plan::Expr::Cast;
 
@@ -782,7 +959,7 @@ mod tests {
     }
 
     /// Specialised String representation
-    fn col_str(column: &ArrayRef, row_index: usize) -> String {
+    fn col_str(column: &dyn Array, row_index: usize) -> String {
         if column.is_null(row_index) {
             return "NULL".to_string();
         }
@@ -797,12 +974,12 @@ mod tests {
 
             let mut r = Vec::with_capacity(*n as usize);
             for i in 0..*n {
-                r.push(col_str(&array, i as usize));
+                r.push(col_str(array.as_ref(), i as usize));
             }
             return format!("[{}]", r.join(","));
         }
 
-        array_value_to_string(column, row_index).unwrap()
+        get_display(column)(row_index)
     }
 
     /// Converts the results into a 2d array of strings, `result[row][column]`
@@ -814,7 +991,7 @@ mod tests {
                 let row_vec = batch
                     .columns()
                     .iter()
-                    .map(|column| col_str(column, row_index))
+                    .map(|column| col_str(column.as_ref(), row_index))
                     .collect();
                 result.push(row_vec);
             }
@@ -976,7 +1153,7 @@ mod tests {
 
     // convert the schema to the same but with all columns set to nullable=true.
     // this allows direct schema comparison ignoring nullable.
-    fn nullable_schema(schema: Arc<Schema>) -> Schema {
+    fn nullable_schema(schema: &Schema) -> Schema {
         Schema::new(
             schema
                 .fields()

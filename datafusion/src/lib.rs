@@ -57,7 +57,7 @@
 //! let results: Vec<RecordBatch> = df.collect().await?;
 //!
 //! // format the results
-//! let pretty_results = arrow::util::pretty::pretty_format_batches(&results)?;
+//! let pretty_results = datafusion::arrow::io::print::write(&results);
 //!
 //! let expected = vec![
 //!     "+---+--------------------------+",
@@ -92,7 +92,7 @@
 //! let results: Vec<RecordBatch> = df.collect().await?;
 //!
 //! // format the results
-//! let pretty_results = arrow::util::pretty::pretty_format_batches(&results)?;
+//! let pretty_results = datafusion::arrow::io::print::write(&results);
 //!
 //! let expected = vec![
 //!     "+---+----------------+",
@@ -197,13 +197,11 @@
 //!
 //! cargo run --example csv_sql
 //!
-//! cargo run --example parquet_sql
+//! PARQUET_TEST_DATA=./parquet-testing/data cargo run --example parquet_sql
 //!
 //! cargo run --example dataframe
 //!
 //! cargo run --example dataframe_in_memory
-//!
-//! cargo run --example parquet_sql
 //!
 //! cargo run --example simple_udaf
 //!
@@ -229,9 +227,10 @@ pub mod variable;
 
 // re-export dependencies from arrow-rs to minimise version maintenance for crate users
 pub use arrow;
-pub use parquet;
 
-pub(crate) mod field_util;
+mod arrow_temporal_util;
+
+pub mod field_util;
 
 #[cfg(feature = "pyarrow")]
 mod pyarrow;
