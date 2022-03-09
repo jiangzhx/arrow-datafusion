@@ -23,23 +23,29 @@ mod file_stream;
 mod json;
 mod parquet;
 
+pub(crate) use self::parquet::plan_to_parquet;
 pub use self::parquet::ParquetExec;
 use arrow::{
-    array::{ArrayData, ArrayRef, DictionaryArray, UInt8BufferBuilder},
+    array::{ArrayData, ArrayRef, DictionaryArray},
     buffer::Buffer,
-    datatypes::{DataType, Field, Schema, SchemaRef, UInt8Type},
+    datatypes::{DataType, Field, Schema, SchemaRef, UInt16Type},
     error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
 pub use avro::AvroExec;
+pub(crate) use csv::plan_to_csv;
 pub use csv::CsvExec;
 pub use json::NdJsonExec;
 
+use crate::error::DataFusionError;
 use crate::{
     datasource::{object_store::ObjectStore, PartitionedFile},
+    error::Result,
     scalar::ScalarValue,
 };
+use arrow::array::{new_null_array, UInt16BufferBuilder};
 use lazy_static::lazy_static;
+use log::info;
 use std::{
     collections::HashMap,
     fmt::{Display, Formatter, Result as FmtResult},
@@ -51,13 +57,13 @@ use super::{ColumnStatistics, Statistics};
 
 lazy_static! {
     /// The datatype used for all partitioning columns for now
-    pub static ref DEFAULT_PARTITION_COLUMN_DATATYPE: DataType = DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+    pub static ref DEFAULT_PARTITION_COLUMN_DATATYPE: DataType = DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8));
 }
 
 /// The base configurations to provide when creating a physical plan for
 /// any given file format.
 #[derive(Debug, Clone)]
-pub struct PhysicalPlanConfig {
+pub struct FileScanConfig {
     /// Store from which the `files` should be fetched
     pub object_store: Arc<dyn ObjectStore>,
     /// Schema before projection. It contains the columns that are expected
@@ -70,15 +76,13 @@ pub struct PhysicalPlanConfig {
     /// Columns on which to project the data. Indexes that are higher than the
     /// number of columns of `file_schema` refer to `table_partition_cols`.
     pub projection: Option<Vec<usize>>,
-    /// The maximum number of records per arrow column
-    pub batch_size: usize,
     /// The minimum number of records required from this source plan
     pub limit: Option<usize>,
     /// The partitioning column names
     pub table_partition_cols: Vec<String>,
 }
 
-impl PhysicalPlanConfig {
+impl FileScanConfig {
     /// Project the schema and the statistics on the given column indices
     fn project(&self) -> (SchemaRef, Statistics) {
         if self.projection.is_none() && self.table_partition_cols.is_empty() {
@@ -164,6 +168,87 @@ impl<'a> Display for FileGroupsDisplay<'a> {
             })
             .collect();
         write!(f, "[{}]", parts.join(", "))
+    }
+}
+
+/// A utility which can adapt file-level record batches to a table schema which may have a schema
+/// obtained from merging multiple file-level schemas.
+///
+/// This is useful for enabling schema evolution in partitioned datasets.
+///
+/// This has to be done in two stages.
+///
+/// 1. Before reading the file, we have to map projected column indexes from the table schema to
+///    the file schema.
+///
+/// 2. After reading a record batch we need to map the read columns back to the expected columns
+///    indexes and insert null-valued columns wherever the file schema was missing a colum present
+///    in the table schema.
+#[derive(Clone, Debug)]
+pub(crate) struct SchemaAdapter {
+    /// Schema for the table
+    table_schema: SchemaRef,
+}
+
+impl SchemaAdapter {
+    pub(crate) fn new(table_schema: SchemaRef) -> SchemaAdapter {
+        Self { table_schema }
+    }
+
+    /// Map projected column indexes to the file schema. This will fail if the table schema
+    /// and the file schema contain a field with the same name and different types.
+    pub fn map_projections(
+        &self,
+        file_schema: &Schema,
+        projections: &[usize],
+    ) -> Result<Vec<usize>> {
+        let mut mapped: Vec<usize> = vec![];
+        for idx in projections {
+            let field = self.table_schema.field(*idx);
+            if let Ok(mapped_idx) = file_schema.index_of(field.name().as_str()) {
+                if file_schema.field(mapped_idx).data_type() == field.data_type() {
+                    mapped.push(mapped_idx)
+                } else {
+                    let msg = format!("Failed to map column projection for field {}. Incompatible data types {:?} and {:?}", field.name(), file_schema.field(mapped_idx).data_type(), field.data_type());
+                    info!("{}", msg);
+                    return Err(DataFusionError::Execution(msg));
+                }
+            }
+        }
+        Ok(mapped)
+    }
+
+    /// Re-order projected columns by index in record batch to match table schema column ordering. If the record
+    /// batch does not contain a column for an expected field, insert a null-valued column at the
+    /// required column index.
+    pub fn adapt_batch(
+        &self,
+        batch: RecordBatch,
+        projections: &[usize],
+    ) -> Result<RecordBatch> {
+        let batch_rows = batch.num_rows();
+
+        let batch_schema = batch.schema();
+
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(batch.columns().len());
+        let batch_cols = batch.columns().to_vec();
+
+        for field_idx in projections {
+            let table_field = &self.table_schema.fields()[*field_idx];
+            if let Some((batch_idx, _name)) =
+                batch_schema.column_with_name(table_field.name().as_str())
+            {
+                cols.push(batch_cols[batch_idx].clone());
+            } else {
+                cols.push(new_null_array(table_field.data_type(), batch_rows))
+            }
+        }
+
+        let projected_schema = Arc::new(self.table_schema.clone().project(projections)?);
+
+        let merged_batch = RecordBatch::try_new(projected_schema, cols)?;
+
+        Ok(merged_batch)
     }
 }
 
@@ -253,17 +338,17 @@ fn create_dict_array(
 
     // build keys array
     let sliced_key_buffer = match key_buffer_cache {
-        Some(buf) if buf.len() >= len => buf.slice(buf.len() - len),
+        Some(buf) if buf.len() >= len * 2 => buf.slice(buf.len() - len * 2),
         _ => {
-            let mut key_buffer_builder = UInt8BufferBuilder::new(len);
-            key_buffer_builder.advance(len); // keys are all 0
+            let mut key_buffer_builder = UInt16BufferBuilder::new(len * 2);
+            key_buffer_builder.advance(len * 2); // keys are all 0
             key_buffer_cache.insert(key_buffer_builder.finish()).clone()
         }
     };
 
     // create data type
     let data_type =
-        DataType::Dictionary(Box::new(DataType::UInt8), Box::new(val.get_datatype()));
+        DataType::Dictionary(Box::new(DataType::UInt16), Box::new(val.get_datatype()));
 
     debug_assert_eq!(data_type, *DEFAULT_PARTITION_COLUMN_DATATYPE);
 
@@ -272,7 +357,9 @@ fn create_dict_array(
         .len(len)
         .add_buffer(sliced_key_buffer);
     builder = builder.add_child_data(dict_vals.data().clone());
-    Arc::new(DictionaryArray::<UInt8Type>::from(builder.build().unwrap()))
+    Arc::new(DictionaryArray::<UInt16Type>::from(
+        builder.build().unwrap(),
+    ))
 }
 
 #[cfg(test)]
@@ -469,15 +556,69 @@ mod tests {
         crate::assert_batches_eq!(expected, &[projected_batch]);
     }
 
+    #[test]
+    fn schema_adapter_adapt_projections() {
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Utf8, true),
+            Field::new("c2", DataType::Int64, true),
+            Field::new("c3", DataType::Int8, true),
+        ]));
+
+        let file_schema = Schema::new(vec![
+            Field::new("c1", DataType::Utf8, true),
+            Field::new("c2", DataType::Int64, true),
+        ]);
+
+        let file_schema_2 = Arc::new(Schema::new(vec![
+            Field::new("c3", DataType::Int8, true),
+            Field::new("c2", DataType::Int64, true),
+        ]));
+
+        let file_schema_3 =
+            Arc::new(Schema::new(vec![Field::new("c3", DataType::Float32, true)]));
+
+        let adapter = SchemaAdapter::new(table_schema);
+
+        let projections1: Vec<usize> = vec![0, 1, 2];
+        let projections2: Vec<usize> = vec![2];
+
+        let mapped = adapter
+            .map_projections(&file_schema, projections1.as_slice())
+            .expect("mapping projections");
+
+        assert_eq!(mapped, vec![0, 1]);
+
+        let mapped = adapter
+            .map_projections(&file_schema, projections2.as_slice())
+            .expect("mapping projections");
+
+        assert!(mapped.is_empty());
+
+        let mapped = adapter
+            .map_projections(&file_schema_2, projections1.as_slice())
+            .expect("mapping projections");
+
+        assert_eq!(mapped, vec![1, 0]);
+
+        let mapped = adapter
+            .map_projections(&file_schema_2, projections2.as_slice())
+            .expect("mapping projections");
+
+        assert_eq!(mapped, vec![0]);
+
+        let mapped = adapter.map_projections(&file_schema_3, projections1.as_slice());
+
+        assert!(mapped.is_err());
+    }
+
     // sets default for configs that play no role in projections
     fn config_for_projection(
         file_schema: SchemaRef,
         projection: Option<Vec<usize>>,
         statistics: Statistics,
         table_partition_cols: Vec<String>,
-    ) -> PhysicalPlanConfig {
-        PhysicalPlanConfig {
-            batch_size: 1024,
+    ) -> FileScanConfig {
+        FileScanConfig {
             file_schema,
             file_groups: vec![vec![]],
             limit: None,

@@ -25,6 +25,7 @@ use crate::error::DataFusionError;
 use crate::logical_plan::dfschema::DFSchemaRef;
 use crate::sql::parser::FileType;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use std::fmt::Formatter;
 use std::{
     collections::HashSet,
     fmt::{self, Display},
@@ -46,6 +47,20 @@ pub enum JoinType {
     Semi,
     /// Anti Join
     Anti,
+}
+
+impl Display for JoinType {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let join_type = match self {
+            JoinType::Inner => "Inner",
+            JoinType::Left => "Left",
+            JoinType::Right => "Right",
+            JoinType::Full => "Full",
+            JoinType::Semi => "Semi",
+            JoinType::Anti => "Anti",
+        };
+        write!(f, "{}", join_type)
+    }
 }
 
 /// Join constraint
@@ -528,8 +543,7 @@ impl LogicalPlan {
                 {
                     self.using_columns.push(
                         on.iter()
-                            .map(|entry| [&entry.0, &entry.1])
-                            .flatten()
+                            .flat_map(|entry| [&entry.0, &entry.1])
                             .cloned()
                             .collect::<HashSet<Column>>(),
                     );
@@ -934,16 +948,22 @@ impl LogicalPlan {
                     LogicalPlan::Join(Join {
                         on: ref keys,
                         join_constraint,
+                        join_type,
                         ..
                     }) => {
                         let join_expr: Vec<String> =
                             keys.iter().map(|(l, r)| format!("{} = {}", l, r)).collect();
                         match join_constraint {
                             JoinConstraint::On => {
-                                write!(f, "Join: {}", join_expr.join(", "))
+                                write!(f, "{} Join: {}", join_type, join_expr.join(", "))
                             }
                             JoinConstraint::Using => {
-                                write!(f, "Join: Using {}", join_expr.join(", "))
+                                write!(
+                                    f,
+                                    "{} Join: Using {}",
+                                    join_type,
+                                    join_expr.join(", ")
+                                )
                             }
                         }
                     }
@@ -1027,7 +1047,7 @@ pub enum PlanType {
 }
 
 impl fmt::Display for PlanType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             PlanType::InitialLogicalPlan => write!(f, "initial_logical_plan"),
             PlanType::OptimizedLogicalPlan { optimizer_name } => {

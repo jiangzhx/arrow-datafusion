@@ -22,21 +22,36 @@ use std::sync::Arc;
 use ballista_core::error::BallistaError;
 use ballista_core::execution_plans::ShuffleWriterExec;
 use ballista_core::serde::protobuf;
+use ballista_core::serde::protobuf::ExecutorRegistration;
 use datafusion::error::DataFusionError;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::prelude::{ExecutionConfig, ExecutionContext};
 
 /// Ballista executor
 pub struct Executor {
+    /// Metadata
+    pub metadata: ExecutorRegistration,
+
     /// Directory for storing partial results
-    work_dir: String,
+    pub work_dir: String,
+
+    /// DataFusion execution context
+    pub ctx: Arc<ExecutionContext>,
 }
 
 impl Executor {
     /// Create a new executor instance
-    pub fn new(work_dir: &str) -> Self {
+    pub fn new(
+        metadata: ExecutorRegistration,
+        work_dir: &str,
+        ctx: Arc<ExecutionContext>,
+    ) -> Self {
         Self {
+            metadata,
             work_dir: work_dir.to_owned(),
+            ctx,
         }
     }
 }
@@ -71,16 +86,17 @@ impl Executor {
             ))
         }?;
 
-        let partitions = exec.execute_shuffle_write(part).await?;
+        let config = ExecutionConfig::new().with_temp_file_path(self.work_dir.clone());
+        let runtime = Arc::new(RuntimeEnv::new(config.runtime)?);
+
+        let partitions = exec.execute_shuffle_write(part, runtime).await?;
 
         println!(
             "=== [{}/{}/{}] Physical plan with metrics ===\n{}\n",
             job_id,
             stage_id,
             part,
-            DisplayableExecutionPlan::with_metrics(&exec)
-                .indent()
-                .to_string()
+            DisplayableExecutionPlan::with_metrics(&exec).indent()
         );
 
         Ok(partitions)

@@ -16,7 +16,6 @@
 // under the License.
 
 #![doc = include_str!("../README.md")]
-#![allow(unused_imports)]
 pub const BALLISTA_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn print_version() {
@@ -27,7 +26,6 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod execution_plans;
-pub mod memory_stream;
 pub mod utils;
 
 #[macro_use]

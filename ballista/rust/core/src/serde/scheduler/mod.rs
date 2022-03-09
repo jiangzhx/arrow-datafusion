@@ -18,14 +18,13 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use datafusion::arrow::array::{
-    ArrayBuilder, ArrayRef, StructArray, StructBuilder, UInt64Array, UInt64Builder,
+    ArrayBuilder, StructArray, StructBuilder, UInt64Array, UInt64Builder,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::logical_plan::LogicalPlan;
+use datafusion::arrow::datatypes::{DataType, Field};
+
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::Partitioning;
 use serde::Serialize;
-use uuid::Uuid;
 
 use super::protobuf;
 use crate::error::BallistaError;
@@ -66,37 +65,184 @@ impl PartitionId {
 #[derive(Debug, Clone)]
 pub struct PartitionLocation {
     pub partition_id: PartitionId,
-    pub executor_meta: ExecutorMeta,
+    pub executor_meta: ExecutorMetadata,
     pub partition_stats: PartitionStats,
     pub path: String,
 }
 
 /// Meta-data for an executor, used when fetching shuffle partitions from other executors
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ExecutorMeta {
+pub struct ExecutorMetadata {
     pub id: String,
     pub host: String,
     pub port: u16,
+    pub grpc_port: u16,
+    pub specification: ExecutorSpecification,
 }
 
 #[allow(clippy::from_over_into)]
-impl Into<protobuf::ExecutorMetadata> for ExecutorMeta {
+impl Into<protobuf::ExecutorMetadata> for ExecutorMetadata {
     fn into(self) -> protobuf::ExecutorMetadata {
         protobuf::ExecutorMetadata {
             id: self.id,
             host: self.host,
             port: self.port as u32,
+            grpc_port: self.grpc_port as u32,
+            specification: Some(self.specification.into()),
         }
     }
 }
 
-impl From<protobuf::ExecutorMetadata> for ExecutorMeta {
+impl From<protobuf::ExecutorMetadata> for ExecutorMetadata {
     fn from(meta: protobuf::ExecutorMetadata) -> Self {
         Self {
             id: meta.id,
             host: meta.host,
             port: meta.port as u16,
+            grpc_port: meta.grpc_port as u16,
+            specification: meta.specification.unwrap().into(),
         }
+    }
+}
+
+/// Specification of an executor, indicting executor resources, like total task slots
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ExecutorSpecification {
+    pub task_slots: u32,
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<protobuf::ExecutorSpecification> for ExecutorSpecification {
+    fn into(self) -> protobuf::ExecutorSpecification {
+        protobuf::ExecutorSpecification {
+            resources: vec![protobuf::executor_resource::Resource::TaskSlots(
+                self.task_slots,
+            )]
+            .into_iter()
+            .map(|r| protobuf::ExecutorResource { resource: Some(r) })
+            .collect(),
+        }
+    }
+}
+
+impl From<protobuf::ExecutorSpecification> for ExecutorSpecification {
+    fn from(input: protobuf::ExecutorSpecification) -> Self {
+        let mut ret = Self { task_slots: 0 };
+        for resource in input.resources {
+            if let Some(protobuf::executor_resource::Resource::TaskSlots(task_slots)) =
+                resource.resource
+            {
+                ret.task_slots = task_slots
+            }
+        }
+        ret
+    }
+}
+
+/// From Spark, available resources for an executor, like available task slots
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutorData {
+    pub executor_id: String,
+    pub total_task_slots: u32,
+    pub available_task_slots: u32,
+}
+
+struct ExecutorResourcePair {
+    total: protobuf::executor_resource::Resource,
+    available: protobuf::executor_resource::Resource,
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<protobuf::ExecutorData> for ExecutorData {
+    fn into(self) -> protobuf::ExecutorData {
+        protobuf::ExecutorData {
+            executor_id: self.executor_id,
+            resources: vec![ExecutorResourcePair {
+                total: protobuf::executor_resource::Resource::TaskSlots(
+                    self.total_task_slots,
+                ),
+                available: protobuf::executor_resource::Resource::TaskSlots(
+                    self.available_task_slots,
+                ),
+            }]
+            .into_iter()
+            .map(|r| protobuf::ExecutorResourcePair {
+                total: Some(protobuf::ExecutorResource {
+                    resource: Some(r.total),
+                }),
+                available: Some(protobuf::ExecutorResource {
+                    resource: Some(r.available),
+                }),
+            })
+            .collect(),
+        }
+    }
+}
+
+impl From<protobuf::ExecutorData> for ExecutorData {
+    fn from(input: protobuf::ExecutorData) -> Self {
+        let mut ret = Self {
+            executor_id: input.executor_id,
+            total_task_slots: 0,
+            available_task_slots: 0,
+        };
+        for resource in input.resources {
+            if let Some(task_slots) = resource.total {
+                if let Some(protobuf::executor_resource::Resource::TaskSlots(
+                    task_slots,
+                )) = task_slots.resource
+                {
+                    ret.total_task_slots = task_slots
+                }
+            };
+            if let Some(task_slots) = resource.available {
+                if let Some(protobuf::executor_resource::Resource::TaskSlots(
+                    task_slots,
+                )) = task_slots.resource
+                {
+                    ret.available_task_slots = task_slots
+                }
+            };
+        }
+        ret
+    }
+}
+
+/// The internal state of an executor, like cpu usage, memory usage, etc
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ExecutorState {
+    // in bytes
+    pub available_memory_size: u64,
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<protobuf::ExecutorState> for ExecutorState {
+    fn into(self) -> protobuf::ExecutorState {
+        protobuf::ExecutorState {
+            metrics: vec![protobuf::executor_metric::Metric::AvailableMemory(
+                self.available_memory_size,
+            )]
+            .into_iter()
+            .map(|m| protobuf::ExecutorMetric { metric: Some(m) })
+            .collect(),
+        }
+    }
+}
+
+impl From<protobuf::ExecutorState> for ExecutorState {
+    fn from(input: protobuf::ExecutorState) -> Self {
+        let mut ret = Self {
+            available_memory_size: u64::MAX,
+        };
+        for metric in input.metrics {
+            if let Some(protobuf::executor_metric::Metric::AvailableMemory(
+                available_memory_size,
+            )) = metric.metric
+            {
+                ret.available_memory_size = available_memory_size
+            }
+        }
+        ret
     }
 }
 
@@ -218,7 +364,7 @@ pub struct ExecutePartition {
     /// The physical plan for this query stage
     pub plan: Arc<dyn ExecutionPlan>,
     /// Location of shuffle partitions that this query stage may depend on
-    pub shuffle_locations: HashMap<PartitionId, ExecutorMeta>,
+    pub shuffle_locations: HashMap<PartitionId, ExecutorMetadata>,
     /// Output partitioning for shuffle writes
     pub output_partitioning: Option<Partitioning>,
 }
@@ -229,7 +375,7 @@ impl ExecutePartition {
         stage_id: usize,
         partition_id: Vec<usize>,
         plan: Arc<dyn ExecutionPlan>,
-        shuffle_locations: HashMap<PartitionId, ExecutorMeta>,
+        shuffle_locations: HashMap<PartitionId, ExecutorMetadata>,
         output_partitioning: Option<Partitioning>,
     ) -> Self {
         Self {

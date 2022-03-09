@@ -18,26 +18,37 @@
 //! Ballista Rust scheduler binary.
 
 use anyhow::{Context, Result};
-use ballista_scheduler::externalscaler::external_scaler_server::ExternalScalerServer;
+use ballista_scheduler::scheduler_server::externalscaler::external_scaler_server::ExternalScalerServer;
 use futures::future::{self, Either, TryFutureExt};
 use hyper::{server::conn::AddrStream, service::make_service_fn, Server};
 use std::convert::Infallible;
 use std::{net::SocketAddr, sync::Arc};
+use tonic::transport::server::Connected;
 use tonic::transport::Server as TonicServer;
 use tower::Service;
 
 use ballista_core::BALLISTA_VERSION;
 use ballista_core::{
-    print_version, serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
+    print_version,
+    serde::protobuf::{
+        scheduler_grpc_server::SchedulerGrpcServer, LogicalPlanNode, PhysicalPlanNode,
+    },
 };
 use ballista_scheduler::api::{get_routes, EitherBody, Error};
 #[cfg(feature = "etcd")]
 use ballista_scheduler::state::EtcdClient;
 #[cfg(feature = "sled")]
 use ballista_scheduler::state::StandaloneClient;
-use ballista_scheduler::{state::ConfigBackendClient, ConfigBackend, SchedulerServer};
 
+use ballista_scheduler::scheduler_server::{
+    SchedulerEnv, SchedulerServer, TaskScheduler,
+};
+use ballista_scheduler::state::{ConfigBackend, ConfigBackendClient};
+
+use ballista_core::config::TaskSchedulingPolicy;
+use ballista_core::serde::BallistaCodec;
 use log::info;
+use tokio::sync::{mpsc, RwLock};
 
 #[macro_use]
 extern crate configure_me;
@@ -51,25 +62,53 @@ mod config {
         "/scheduler_configure_me_config.rs"
     ));
 }
+
 use config::prelude::*;
+use datafusion::prelude::ExecutionContext;
 
 async fn start_server(
     config_backend: Arc<dyn ConfigBackendClient>,
     namespace: String,
     addr: SocketAddr,
+    policy: TaskSchedulingPolicy,
 ) -> Result<()> {
     info!(
         "Ballista v{} Scheduler listening on {:?}",
         BALLISTA_VERSION, addr
     );
-
-    Ok(Server::bind(&addr)
-        .serve(make_service_fn(move |request: &AddrStream| {
-            let scheduler_server = SchedulerServer::new(
+    //should only call SchedulerServer::new() once in the process
+    info!(
+        "Starting Scheduler grpc server with task scheduling policy of {:?}",
+        policy
+    );
+    let scheduler_server: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+        match policy {
+            TaskSchedulingPolicy::PushStaged => {
+                // TODO make the buffer size configurable
+                let (tx_job, rx_job) = mpsc::channel::<String>(10000);
+                let scheduler_server = SchedulerServer::new_with_policy(
+                    config_backend.clone(),
+                    namespace.clone(),
+                    policy,
+                    Some(SchedulerEnv { tx_job }),
+                    Arc::new(RwLock::new(ExecutionContext::new())),
+                    BallistaCodec::default(),
+                );
+                let task_scheduler =
+                    TaskScheduler::new(Arc::new(scheduler_server.clone()));
+                task_scheduler.start(rx_job);
+                scheduler_server
+            }
+            _ => SchedulerServer::new(
                 config_backend.clone(),
                 namespace.clone(),
-                request.remote_addr().ip(),
-            );
+                Arc::new(RwLock::new(ExecutionContext::new())),
+                BallistaCodec::default(),
+            ),
+        };
+
+    Server::bind(&addr)
+        .serve(make_service_fn(move |request: &AddrStream| {
             let scheduler_grpc_server =
                 SchedulerGrpcServer::new(scheduler_server.clone());
 
@@ -79,10 +118,16 @@ async fn start_server(
                 .add_service(scheduler_grpc_server)
                 .add_service(keda_scaler)
                 .into_service();
-            let mut warp = warp::service(get_routes(scheduler_server));
+            let mut warp = warp::service(get_routes(scheduler_server.clone()));
 
+            let connect_info = request.connect_info();
             future::ok::<_, Infallible>(tower::service_fn(
                 move |req: hyper::Request<hyper::Body>| {
+                    // Set the connect info from hyper to tonic
+                    let (mut parts, body) = req.into_parts();
+                    parts.extensions.insert(connect_info.clone());
+                    let req = http::Request::from_parts(parts, body);
+
                     let header = req.headers().get(hyper::header::ACCEPT);
                     if header.is_some() && header.unwrap().eq("application/json") {
                         return Either::Left(
@@ -101,7 +146,7 @@ async fn start_server(
             ))
         }))
         .await
-        .context("Could not start grpc server")?)
+        .context("Could not start grpc server")
 }
 
 #[tokio::main]
@@ -158,6 +203,8 @@ async fn main() -> Result<()> {
             )
         }
     };
-    start_server(client, namespace, addr).await?;
+
+    let policy: TaskSchedulingPolicy = opt.scheduler_policy;
+    start_server(client, namespace, addr, policy).await?;
     Ok(())
 }
