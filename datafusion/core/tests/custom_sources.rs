@@ -24,7 +24,6 @@ use datafusion::from_slice::FromSlice;
 use datafusion::logical_expr::{
     col, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, UNNAMED_TABLE,
 };
-use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::{
     project_schema, ColumnStatistics, ExecutionPlan, Partitioning, RecordBatchStream,
@@ -255,17 +254,11 @@ async fn optimizers_catch_all_statistics() {
 
     let physical_plan = df.create_physical_plan().await.unwrap();
 
-    // when the optimization kicks in, the source is replaced by an EmptyExec
-    assert!(
-        contains_empty_exec(Arc::clone(&physical_plan)),
-        "Expected aggregate_statistics optimizations missing: {physical_plan:?}"
-    );
-
     let expected = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
-            Field::new("COUNT(UInt8(1))", DataType::Int64, false),
-            Field::new("MIN(c1)", DataType::Int32, false),
-            Field::new("MAX(c1)", DataType::Int32, false),
+            Field::new("COUNT(UInt8(1))", DataType::Int64, true),
+            Field::new("MIN(test.c1)", DataType::Int32, true),
+            Field::new("MAX(test.c1)", DataType::Int32, true),
         ])),
         vec![
             Arc::new(Int64Array::from_slice([4])),
@@ -280,14 +273,4 @@ async fn optimizers_catch_all_statistics() {
 
     assert_eq!(actual.len(), 1);
     assert_eq!(format!("{:?}", actual[0]), format!("{expected:?}"));
-}
-
-fn contains_empty_exec(plan: Arc<dyn ExecutionPlan>) -> bool {
-    if plan.as_any().is::<EmptyExec>() {
-        true
-    } else if plan.children().len() != 1 {
-        false
-    } else {
-        contains_empty_exec(Arc::clone(&plan.children()[0]))
-    }
 }

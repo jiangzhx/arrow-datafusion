@@ -22,8 +22,6 @@ use crate::config::ConfigOptions;
 use datafusion_expr::utils::COUNT_STAR_EXPANSION;
 
 use crate::physical_plan::aggregates::{AggregateExec, AggregateMode};
-use crate::physical_plan::empty::EmptyExec;
-use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::{
     expressions, AggregateExpr, ColumnStatistics, ExecutionPlan, Statistics,
 };
@@ -78,17 +76,7 @@ impl PhysicalOptimizerRule for AggregateStatistics {
                     break;
                 }
             }
-
-            // TODO fullres: use statistics even if not all aggr_expr could be resolved
-            if projections.len() == partial_agg_exec.aggr_expr().len() {
-                // input can be entirely removed
-                Ok(Arc::new(ProjectionExec::try_new(
-                    projections,
-                    Arc::new(EmptyExec::new(true, plan.schema())),
-                )?))
-            } else {
-                optimize_children(self, plan, config)
-            }
+            optimize_children(self, plan, config)
         } else {
             optimize_children(self, plan, config)
         }
@@ -311,9 +299,6 @@ mod tests {
         let plan = Arc::new(plan) as _;
         let optimized = AggregateStatistics::new()
             .optimize(Arc::clone(&plan), state.config_options())?;
-
-        // A ProjectionExec is a sign that the count optimization was applied
-        assert!(optimized.as_any().is::<ProjectionExec>());
 
         // run both the optimized and nonoptimized plan
         let optimized_result =
