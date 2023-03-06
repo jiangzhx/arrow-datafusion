@@ -16,20 +16,17 @@
 // under the License.
 
 //! Utilizing exact statistics from sources to avoid scanning data
-use std::sync::Arc;
-
+use super::optimizer::PhysicalOptimizerRule;
+use super::utils::optimize_children;
 use crate::config::ConfigOptions;
-use datafusion_expr::utils::COUNT_STAR_EXPANSION;
-
+use crate::error::Result;
 use crate::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use crate::physical_plan::{
     expressions, AggregateExpr, ColumnStatistics, ExecutionPlan, Statistics,
 };
 use crate::scalar::ScalarValue;
-
-use super::optimizer::PhysicalOptimizerRule;
-use super::utils::optimize_children;
-use crate::error::Result;
+use datafusion_expr::utils::COUNT_STAR_EXPANSION;
+use std::sync::Arc;
 
 /// Optimizer that uses available statistics for aggregate functions
 #[derive(Default)]
@@ -299,6 +296,9 @@ mod tests {
         let plan = Arc::new(plan) as _;
         let optimized = AggregateStatistics::new()
             .optimize(Arc::clone(&plan), state.config_options())?;
+
+        // A ProjectionExec is a sign that the count optimization was applied
+        assert!(optimized.as_any().is::<ProjectionExec>());
 
         // run both the optimized and nonoptimized plan
         let optimized_result =
