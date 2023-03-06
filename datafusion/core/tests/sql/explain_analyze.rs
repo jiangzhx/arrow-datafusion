@@ -775,9 +775,13 @@ async fn explain_physical_plan_only() {
 
     let expected = vec![vec![
         "physical_plan",
-        "ProjectionExec: expr=[2 as COUNT(UInt8(1))]\
-        \n  EmptyExec: produce_one_row=true\
-        \n",
+        "AggregateExec: mode=Final, gby=[], aggr=[COUNT(UInt8(1))]
+  CoalescePartitionsExec
+    AggregateExec: mode=Partial, gby=[], aggr=[COUNT(UInt8(1))]
+      RepartitionExec: partitioning=RoundRobinBatch(NUM_CORES), input_partitions=1
+        ProjectionExec: expr=[column1@0 as column1]
+          ValuesExec
+",
     ]];
     assert_eq!(expected, actual);
 }
