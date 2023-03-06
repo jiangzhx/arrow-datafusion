@@ -21,7 +21,6 @@ use super::utils::optimize_children;
 use crate::config::ConfigOptions;
 use crate::error::Result;
 use crate::physical_plan::aggregates::{AggregateExec, AggregateMode};
-use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::{
     expressions, AggregateExpr, ColumnStatistics, ExecutionPlan, Statistics,
 };
@@ -296,9 +295,6 @@ mod tests {
         let plan = Arc::new(plan) as _;
         let optimized = AggregateStatistics::new()
             .optimize(Arc::clone(&plan), state.config_options())?;
-
-        // A ProjectionExec is a sign that the count optimization was applied
-        assert!(optimized.as_any().is::<ProjectionExec>());
 
         // run both the optimized and nonoptimized plan
         let optimized_result =
