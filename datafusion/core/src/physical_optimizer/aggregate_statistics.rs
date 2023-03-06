@@ -21,13 +21,13 @@ use super::utils::optimize_children;
 use crate::config::ConfigOptions;
 use crate::error::Result;
 use crate::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::{
     expressions, AggregateExpr, ColumnStatistics, ExecutionPlan, Statistics,
 };
 use crate::scalar::ScalarValue;
 use datafusion_expr::utils::COUNT_STAR_EXPANSION;
 use std::sync::Arc;
-
 /// Optimizer that uses available statistics for aggregate functions
 #[derive(Default)]
 pub struct AggregateStatistics {}
