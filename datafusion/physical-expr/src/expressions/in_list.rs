@@ -161,8 +161,8 @@ where
         }
     };
 
-    match data.null_buffer() {
-        Some(buffer) => BitIndexIterator::new(buffer.as_ref(), data.offset(), data.len())
+    match data.nulls() {
+        Some(buffer) => BitIndexIterator::new(buffer.buffer(), data.offset(), data.len())
             .for_each(insert_value),
         None => (0..data.len()).for_each(insert_value),
     }

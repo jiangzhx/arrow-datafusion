@@ -139,39 +139,40 @@ enum TpchOpt {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    use BenchmarkSubCommandOpt::*;
-
-    env_logger::init();
-    match TpchOpt::from_args() {
-        TpchOpt::Benchmark(DataFusionBenchmark(opt)) => {
-            benchmark_datafusion(opt).await.map(|_| ())
-        }
-        TpchOpt::Convert(opt) => {
-            let compression = match opt.compression.as_str() {
-                "none" => Compression::UNCOMPRESSED,
-                "snappy" => Compression::SNAPPY,
-                "brotli" => Compression::BROTLI,
-                "gzip" => Compression::GZIP,
-                "lz4" => Compression::LZ4,
-                "lz0" => Compression::LZO,
-                "zstd" => Compression::ZSTD,
-                other => {
-                    return Err(DataFusionError::NotImplemented(format!(
-                        "Invalid compression format: {other}"
-                    )));
-                }
-            };
-            convert_tbl(
-                opt.input_path.to_str().unwrap(),
-                opt.output_path.to_str().unwrap(),
-                &opt.file_format,
-                opt.partitions,
-                opt.batch_size,
-                compression,
-            )
-            .await
-        }
-    }
+    Ok(())
+    // use BenchmarkSubCommandOpt::*;
+    //
+    // env_logger::init();
+    // match TpchOpt::from_args() {
+    //     TpchOpt::Benchmark(DataFusionBenchmark(opt)) => {
+    //         benchmark_datafusion(opt).await.map(|_| ())
+    //     }
+    //     TpchOpt::Convert(opt) => {
+    //         let compression = match opt.compression.as_str() {
+    //             "none" => Compression::UNCOMPRESSED,
+    //             "snappy" => Compression::SNAPPY,
+    //             "brotli" => Compression::BROTLI,
+    //             "gzip" => Compression::GZIP,
+    //             "lz4" => Compression::LZ4,
+    //             "lz0" => Compression::LZO,
+    //             "zstd" => Compression::ZSTD,
+    //             other => {
+    //                 return Err(DataFusionError::NotImplemented(format!(
+    //                     "Invalid compression format: {other}"
+    //                 )));
+    //             }
+    //         };
+    //         convert_tbl(
+    //             opt.input_path.to_str().unwrap(),
+    //             opt.output_path.to_str().unwrap(),
+    //             &opt.file_format,
+    //             opt.partitions,
+    //             opt.batch_size,
+    //             compression,
+    //         )
+    //         .await
+    //     }
+    // }
 }
 
 const TPCH_QUERY_START_ID: usize = 1;

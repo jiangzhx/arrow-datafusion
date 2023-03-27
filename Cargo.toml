@@ -45,12 +45,19 @@ repository = "https://github.com/apache/arrow-datafusion"
 rust-version = "1.64"
 
 [workspace.dependencies]
-arrow = { version = "34.0.0", features = ["prettyprint"] }
-arrow-flight = { version = "34.0.0", features = ["flight-sql-experimental"] }
-arrow-buffer = { version = "34.0.0", default-features = false }
-arrow-schema = { version = "34.0.0", default-features = false }
-arrow-array = { version = "34.0.0", default-features = false, features = ["chrono-tz"] }
-parquet = { version = "34.0.0", features = ["arrow", "async"] }
+#arrow = { version = "34.0.0", features = ["prettyprint"] }
+#arrow-flight = { version = "34.0.0", features = ["flight-sql-experimental"] }
+#arrow-buffer = { version = "34.0.0", default-features = false }
+#arrow-schema = { version = "34.0.0", default-features = false }
+#arrow-array = { version = "34.0.0", default-features = false, features = ["chrono-tz"] }
+#parquet = { version = "34.0.0", features = ["arrow", "async"] }
+
+arrow = { git="https://github.com/apache/arrow-rs.git", features = ["prettyprint"] }
+arrow-flight = { git="https://github.com/apache/arrow-rs.git", features = ["flight-sql-experimental"] }
+arrow-buffer = { git="https://github.com/apache/arrow-rs.git", default-features = false }
+arrow-schema = { git="https://github.com/apache/arrow-rs.git", default-features = false }
+arrow-array = { git="https://github.com/apache/arrow-rs.git", default-features = false, features = ["chrono-tz"] }
+parquet = { git="https://github.com/apache/arrow-rs.git", features = ["arrow", "async"] }
 
 [profile.release]
 codegen-units = 1
