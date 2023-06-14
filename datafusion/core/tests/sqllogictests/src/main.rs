@@ -267,10 +267,6 @@ async fn context_for_test_file(relative_path: &Path) -> Option<TestContext> {
             info!("Registering aggregate tables");
             setup::register_aggregate_tables(test_ctx.session_ctx()).await;
         }
-        "scalar.slt" => {
-            info!("Registering scalar tables");
-            setup::register_scalar_tables(test_ctx.session_ctx()).await;
-        }
         "avro.slt" => {
             #[cfg(feature = "avro")]
             {
